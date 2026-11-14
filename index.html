@@ -233,7 +233,7 @@ async function login(){
   const d=await r.json();
   if(!d.access_token||!d.user?.id)throw Error('No se pudo validar el acceso');
   d.expires_at=Math.floor(Date.now()/1000)+Number(d.expires_in||3600);
-  setSession(d);el('cloudPassword').value='';msg('Sesión iniciada correctamente.');
+  setSession(d);el('cloudPassword').value='';msg('Sesión iniciada. Cargando biblioteca…');await autoRestore();
  }catch(e){msg('No se pudo iniciar sesión. Verifica tu correo y contraseña. '+e.message)}
 }
 async function changePassword(){
@@ -251,11 +251,64 @@ async function changePassword(){
 }
 el('cloudPasswordChange').onclick=changePassword;
 el('cloudLogin').onclick=login;el('cloudPassword').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
-(async()=>{try{const hash=new URLSearchParams(location.hash.slice(1));if(hash.has('access_token')){const r=await request('/auth/v1/user',{headers:{Authorization:'Bearer '+hash.get('access_token')}});const user=await r.json();setSession({access_token:hash.get('access_token'),refresh_token:hash.get('refresh_token'),expires_at:Math.floor(Date.now()/1000)+Number(hash.get('expires_in')||3600),user});history.replaceState({},'',location.pathname+location.search);msg('Sesión iniciada. Ya puedes sincronizar.')}else{const saved=JSON.parse(localStorage.getItem(SESSION)||'null');if(saved){session=saved;await refreshSession();const r=await request('/auth/v1/user',{headers:{Authorization:'Bearer '+session.access_token}});const verified=await r.json();if(!verified.id)throw Error('Sesión inválida');session.user=verified;setSession(session)}}}catch(e){setSession(null);msg('Inicia sesión para usar la nube.')}})();
+(async()=>{try{const hash=new URLSearchParams(location.hash.slice(1));if(hash.has('access_token')){const r=await request('/auth/v1/user',{headers:{Authorization:'Bearer '+hash.get('access_token')}});const user=await r.json();setSession({access_token:hash.get('access_token'),refresh_token:hash.get('refresh_token'),expires_at:Math.floor(Date.now()/1000)+Number(hash.get('expires_in')||3600),user});history.replaceState({},'',location.pathname+location.search);await autoRestore()}else{const saved=JSON.parse(localStorage.getItem(SESSION)||'null');if(saved){session=saved;await refreshSession();const r=await request('/auth/v1/user',{headers:{Authorization:'Bearer '+session.access_token}});const verified=await r.json();if(!verified.id)throw Error('Sesión inválida');session.user=verified;setSession(session);await autoRestore()}}}catch(e){setSession(null);msg('Inicia sesión para usar la nube.')}})();
 el('cloudLogout').onclick=async()=>{const token=session?.access_token;setSession(null);msg('Sesión cerrada. Inicia sesión para acceder.');if(token)try{await fetch(URL+'/auth/v1/logout',{method:'POST',headers:{apikey:KEY,Authorization:'Bearer '+token}})}catch{}};
 async function putFile(path,bytes){await request('/storage/v1/object/annota-docs/'+path,{method:'POST',headers:{'Content-Type':'application/pdf','x-upsert':'true'},body:bytes})}
 async function upload(){if(syncing)return;if(!session)return msg('Primero inicia sesión.');syncing=true;try{await refreshSession();msg('Subiendo documentos...');const database=await ensureDatabase();const list=await req('docs','readonly',st=>st.getAll());const user=session.user.id;for(let i=0;i<list.length;i++){const d=list[i],path=user+'/'+encodeURIComponent(d.id)+'.pdf';await putFile(path,d.bytes);await request('/rest/v1/annota_documents?on_conflict=user_id,id',{method:'POST',headers:{'Content-Type':'application/json','Prefer':'resolution=merge-duplicates'},body:JSON.stringify({id:d.id,user_id:user,name:d.name,folder_id:d.folderId||null,annotations:d.annotations||[],scratch:d.scratch||'',updated_at:new Date(d.updated||Date.now()).toISOString(),storage_path:user+'/'+d.id+'.pdf'})});msg('Subidos '+(i+1)+' de '+list.length+' PDFs...')}await request('/rest/v1/annota_preferences?on_conflict=user_id',{method:'POST',headers:{'Content-Type':'application/json','Prefer':'resolution=merge-duplicates'},body:JSON.stringify({user_id:user,folders:folders||[]})});msg('✓ Copia en Supabase completa: '+list.length+' PDFs.')}catch(e){msg('Error de sincronización: '+e.message)}finally{syncing=false}}
 async function download(){if(syncing)return;if(!session)return msg('Primero inicia sesión.');if(!confirm('Recuperar documentos de Supabase. Los documentos con el mismo ID se reemplazarán localmente. ¿Continuar?'))return;syncing=true;try{await refreshSession();const r=await request('/rest/v1/annota_documents?select=*&order=updated_at.desc');const list=await r.json();for(let i=0;i<list.length;i++){const d=list[i];const f=await request('/storage/v1/object/authenticated/annota-docs/'+d.storage_path);const bytes=await f.arrayBuffer();await req('docs','readwrite',st=>st.put({id:d.id,name:d.name,bytes,annotations:d.annotations||[],scratch:d.scratch||'',folderId:d.folder_id,updated:new Date(d.updated_at).getTime()}));msg('Recuperados '+(i+1)+' de '+list.length+' PDFs...')}const pr=await request('/rest/v1/annota_preferences?select=folders&limit=1');const prefs=await pr.json();if(prefs[0]?.folders&&confirm('¿Restaurar también las carpetas de la nube?')){folders=prefs[0].folders;persistFolders()}await refresh();if(docs.length)await openDoc(docs[0].id);msg('✓ Recuperación terminada: '+list.length+' PDFs.')}catch(e){msg('Error de recuperación: '+e.message)}finally{syncing=false}}
+
+// Sincronización automática no destructiva: conserva versiones locales más recientes.
+let cloudReady=false,cloudSaveTimer=null,cloudSaving=false,cloudPending=false;
+async function autoRestore(){
+ if(!session)return;
+ try{
+  await ensureDatabase();await refreshSession();
+  const response=await request('/rest/v1/annota_documents?select=*&order=updated_at.desc');
+  const list=await response.json();let loaded=0;
+  for(const d of list){
+   const local=await req('docs','readonly',st=>st.get(d.id));
+   const remoteTime=new Date(d.updated_at).getTime();
+   if(local && (Number(local.updated)||0)>=remoteTime)continue;
+   const file=await request('/storage/v1/object/authenticated/annota-docs/'+d.storage_path);
+   const bytes=await file.arrayBuffer();
+   await req('docs','readwrite',st=>st.put({id:d.id,name:d.name,bytes,annotations:d.annotations||[],scratch:d.scratch||'',folderId:d.folder_id,updated:remoteTime}));loaded++;
+  }
+  const pr=await request('/rest/v1/annota_preferences?select=folders&limit=1');
+  const prefs=await pr.json();
+  if(prefs[0]?.folders?.length && !folders.length){folders=prefs[0].folders;persistFolders()}
+  await refresh();if(docs.length&&!current)await openDoc(docs[0].id);
+  cloudReady=true;msg('✓ Biblioteca lista: '+docs.length+' PDF(s). Sincronización automática activa.');
+  if(docs.some(d=>!list.some(r=>r.id===d.id)))scheduleCloudSave();
+ }catch(e){cloudReady=false;msg('No se pudo cargar automáticamente: '+e.message+'. Puedes usar Recuperar de la nube.');}
+}
+function scheduleCloudSave(){if(!session||!cloudReady)return;clearTimeout(cloudSaveTimer);cloudSaveTimer=setTimeout(syncCloudChanges,1800)}
+async function syncCloudChanges(){
+ if(!session||!cloudReady)return;
+ if(cloudSaving||syncing){cloudPending=true;return}
+ cloudSaving=true;
+ try{
+  await refreshSession();
+  const list=await req('docs','readonly',st=>st.getAll());
+  const remoteResponse=await request('/rest/v1/annota_documents?select=id,updated_at');
+  const remote=new Map((await remoteResponse.json()).map(d=>[d.id,new Date(d.updated_at).getTime()]));
+  const user=session.user.id;let count=0;
+  for(const d of list){
+   if((remote.get(d.id)||0)>=(Number(d.updated)||0))continue;
+   await putFile(user+'/'+encodeURIComponent(d.id)+'.pdf',d.bytes);
+   await request('/rest/v1/annota_documents?on_conflict=user_id,id',{method:'POST',headers:{'Content-Type':'application/json','Prefer':'resolution=merge-duplicates'},body:JSON.stringify({id:d.id,user_id:user,name:d.name,folder_id:d.folderId||null,annotations:d.annotations||[],scratch:d.scratch||'',updated_at:new Date(d.updated||Date.now()).toISOString(),storage_path:user+'/'+d.id+'.pdf'})});count++;
+  }
+  await request('/rest/v1/annota_preferences?on_conflict=user_id',{method:'POST',headers:{'Content-Type':'application/json','Prefer':'resolution=merge-duplicates'},body:JSON.stringify({user_id:user,folders:folders||[]})});
+  msg('✓ Sincronizado con la nube'+(count?' · '+count+' actualizado(s)':''));
+ }catch(e){msg('Pendiente de sincronizar: '+e.message)}
+ finally{cloudSaving=false;if(cloudPending){cloudPending=false;scheduleCloudSave()}}
+}
+const originalSave=save;
+save=async function(){await originalSave();scheduleCloudSave()};
+const originalImportFile=importFile;
+importFile=async function(file){await originalImportFile(file);scheduleCloudSave()};
+const originalPersistFolders=persistFolders;
+persistFolders=function(){originalPersistFolders();scheduleCloudSave()};
+
 el('cloudUpload').onclick=upload;el('cloudDownload').onclick=download;
 })();
 </script></body></html>
