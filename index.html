@@ -311,4 +311,47 @@ persistFolders=function(){originalPersistFolders();scheduleCloudSave()};
 
 el('cloudUpload').onclick=upload;el('cloudDownload').onclick=download;
 })();
-</script></body></html>
+</script>
+<!-- Panel de sincronización plegable: no modifica los datos ni las rutinas de Supabase. -->
+<style>
+body.cloud-authorized #cloudPanel.cloud-collapsed{width:48px!important;height:48px!important;max-width:48px!important;min-width:48px!important;padding:0!important;border-radius:14px!important;overflow:hidden!important}
+body.cloud-authorized #cloudPanel.cloud-collapsed > :not(#cloudPanelToggle){display:none!important}
+#cloudPanelToggle{position:absolute;right:7px;top:7px;width:32px;height:32px;padding:0;display:flex;align-items:center;justify-content:center;font-size:17px;z-index:2}
+body.cloud-authorized #cloudPanel:not(.cloud-collapsed){padding-top:48px!important}
+body.cloud-authorized #cloudPanel.cloud-collapsed #cloudPanelToggle{right:7px;top:7px}
+</style>
+<script>
+(function(){
+  const panel=document.getElementById('cloudPanel');if(!panel)return;
+  const btn=document.createElement('button');btn.id='cloudPanelToggle';btn.type='button';
+  btn.setAttribute('aria-label','Mostrar u ocultar sincronización');
+  panel.prepend(btn);
+  function update(){
+    const logged=document.body.classList.contains('cloud-authorized');
+    if(!logged){panel.classList.remove('cloud-collapsed');btn.hidden=true;return}
+    btn.hidden=false;
+    const collapsed=panel.classList.contains('cloud-collapsed');
+    btn.textContent=collapsed?'☁':'×';
+    btn.title=collapsed?'Mostrar sincronización':'Ocultar sincronización';
+    btn.setAttribute('aria-expanded',String(!collapsed));
+  }
+  btn.addEventListener('click',()=>{
+    if(!document.body.classList.contains('cloud-authorized'))return;
+    panel.classList.toggle('cloud-collapsed');
+    try{localStorage.setItem('annota-cloud-panel-collapsed',panel.classList.contains('cloud-collapsed')?'1':'0')}catch{}
+    update();
+  });
+  const observer=new MutationObserver(()=>{
+    if(document.body.classList.contains('cloud-authorized')){
+      try{if(localStorage.getItem('annota-cloud-panel-collapsed')!=='0')panel.classList.add('cloud-collapsed')}catch{panel.classList.add('cloud-collapsed')}
+    }
+    update();
+  });
+  observer.observe(document.body,{attributes:true,attributeFilter:['class']});
+  if(document.body.classList.contains('cloud-authorized')){
+    try{if(localStorage.getItem('annota-cloud-panel-collapsed')!=='0')panel.classList.add('cloud-collapsed')}catch{panel.classList.add('cloud-collapsed')}
+  }
+  update();
+})();
+</script>
+</body></html>
